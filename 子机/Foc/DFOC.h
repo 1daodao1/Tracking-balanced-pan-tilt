@@ -50,6 +50,7 @@ float M0_rawElectricAngle(void);
 float M1_rawElectricAngle(void);
 void M0_Set_Velocity_Voltage(float Target);
 void M1_Set_Velocity_Voltage(float Target);
+void Ctrl_Timer_Init(void);
 
 extern struct AS5600_Sensor Angle_Sensor0;
 extern struct AS5600_Sensor Angle_Sensor1;

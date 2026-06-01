@@ -7,6 +7,7 @@
 #define _1_SQRT3   0.57735026919f
 #define _2_SQRT3   1.15470053838f
 #define _SQRT3     1.73205080757f // 增加预计算常数，替代 sqrt(3) 库函数调用
+volatile uint8_t g_ctrl_tick = 0;
 
 //对于结构体，如果是首元素，则可以如此定义
 Motor_t M0 = {0};  
@@ -14,48 +15,48 @@ Motor_t M1 = {1};
 
 // 角度环 (输出通常为目标速度，需根据 velocity_limit 设定限幅)
 PID_t M0_ANG_PID = {
-    .Kp = 2.0f, 
+    .Kp = 0.15f, 
 	  .Ki = 0.0f,
-  	.Kd = 0.0f,
-    .OutMax = 10.0f,
-    .OutMin = -10.0f,    // 替换为你的速度上限
+  	.Kd = 0.002f,
+    .OutMax = 1.0f,
+    .OutMin = -1.0f,    // 替换为你的速度上限
     .ErrorIntMax = 0, 
 	  .ErrorIntMin = 0     // 纯P环无需积分限幅
 };
 PID_t M1_ANG_PID = {
-    .Kp = 2.0f, 
+    .Kp = 0.15f, 
   	.Ki = 0.0f,
-  	.Kd = 0.0f,
-    .OutMax = 10.0f,
-    .OutMin = -10.0f, 
+  	.Kd = 0.002f,
+    .OutMax = 1.0f,
+    .OutMin = -1.0f, 
     .ErrorIntMax = 0, 
   	.ErrorIntMin = 0
 };
 
 // 速度环 (输出通常为目标电流/交轴电压，需设定电流或电压限幅)
 PID_t M0_VEL_PID = {
-    .Kp = 0.2f,
-  	.Ki = 0.5f,
+    .Kp = 0.1f,
+  	.Ki = 0.2f,
   	.Kd = 0.0f,
-    .OutMax = 2.0f,
-  	.OutMin = -2.0f,     // 替换为目标电流/扭矩上限
-    .ErrorIntMax = 2.0f, 
-   	.ErrorIntMin = -2.0f // 积分限幅通常与输出限幅保持一致或略小
+    .OutMax = 1.0f,
+  	.OutMin = -1.0f,     // 替换为目标电流/扭矩上限
+    .ErrorIntMax = 1.0f, 
+   	.ErrorIntMin = -1.0f // 积分限幅通常与输出限幅保持一致或略小
 };
 PID_t M1_VEL_PID = {
-    .Kp = 0.4f,
-  	.Ki = 2.0f,
+    .Kp = 0.1f,
+  	.Ki = 0.2f,
   	.Kd = 0.0f,
-    .OutMax = 6.0f,
-  	.OutMin = -6.0f,
-    .ErrorIntMax = 6.0f,
-  	.ErrorIntMin = -6.0f
+    .OutMax = 1.0f,
+  	.OutMin = -1.0f,
+    .ErrorIntMax = 1.0f,
+  	.ErrorIntMin = -1.0f
 };
 
 // 电流环 (输出为相电压，绝对不能超过母线电压 voltage_limit)
 PID_t M0_CUR_PID = {
     .Kp = 2.0f,
-  	.Ki = 200.0f,
+  	.Ki = 50.0f,
   	.Kd = 0.0f,
     .OutMax = 12.0f,
     .OutMin = -12.0f,    
@@ -64,7 +65,7 @@ PID_t M0_CUR_PID = {
 };
 PID_t M1_CUR_PID = {
     .Kp = 2.0f,
-  	.Ki = 200.0f,
+  	.Ki = 50.0f,
   	.Kd = 0.0f,
     .OutMax = 12.0f,
     .OutMin = -12.0f,
@@ -91,7 +92,7 @@ extern int M0_PP , M0_DIR ;
 extern int M1_PP , M1_DIR ;
 
 float velocity_limit = 10.0f;
-
+#define ANG_DEADBAND_RAD  0.03f
 //相当于启动电机的总开关
 void Motor_en()
 {
@@ -205,7 +206,7 @@ void Check_Sensor(void)
 {
     M0_zero_elc_Angle = 0.0f;
 
-    SetPhaseVoltage(&M0, 1.5f, _3PI_2);
+    SetPhaseVoltage(&M0, 3.0f, _3PI_2);
     Delay_ms(1000);
 
     M0_zero_elc_Angle = M0_rawElectricAngle();
@@ -215,12 +216,7 @@ void Check_Sensor(void)
     SetPhaseVoltage(&M0, 0.0f, _3PI_2);
     Delay_ms(500);
     
-	//修改，先不测试M1
-//    SetPhaseVoltage(&M1, 3.0f, _3PI_2);
-//    Delay_ms(3000);
-//    M1_zero_elc_Angle = M1_electricAngle();
-//    SetPhaseVoltage(&M1, 0.0f, _3PI_2);
-//    Delay_ms(500);
+
 }
 
 void Check_Sensor_M1(void)
@@ -254,8 +250,43 @@ void FOC_Init(float power)
     AS5600_Sensor_Init(&Angle_Sensor0);
     AS5600_Sensor_Init(&Angle_Sensor1);
 	
+	  Check_Sensor();
     Check_Sensor_M1();
 }
+
+void Ctrl_Timer_Init(void)            /* TIM4 @ 1kHz */
+{
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM4, ENABLE);
+
+    TIM_TimeBaseInitTypeDef t;
+    t.TIM_Prescaler         = 72 - 1;     /* 72MHz/72 = 1MHz */
+    t.TIM_Period            = 1000 - 1;   /* 1MHz/1000 = 1kHz */
+    t.TIM_ClockDivision     = TIM_CKD_DIV1;
+    t.TIM_CounterMode       = TIM_CounterMode_Up;
+    t.TIM_RepetitionCounter = 0;
+    TIM_TimeBaseInit(TIM4, &t);
+
+    TIM_ClearITPendingBit(TIM4, TIM_IT_Update);
+    TIM_ITConfig(TIM4, TIM_IT_Update, ENABLE);
+
+    NVIC_InitTypeDef n;
+    n.NVIC_IRQChannel                   = TIM4_IRQn;
+    n.NVIC_IRQChannelPreemptionPriority = 2;
+    n.NVIC_IRQChannelSubPriority        = 0;
+    n.NVIC_IRQChannelCmd                = ENABLE;
+    NVIC_Init(&n);
+
+    TIM_Cmd(TIM4, ENABLE);
+}
+
+void TIM4_IRQHandler(void)
+{
+    if (TIM_GetITStatus(TIM4, TIM_IT_Update) != RESET) {
+        TIM_ClearITPendingBit(TIM4, TIM_IT_Update);
+        g_ctrl_tick = 1;
+    }
+}
+
 
 // 单电流环
 void M0_Set_CurTorque(float Target)
@@ -297,48 +328,48 @@ uint16_t print_cnt = 0;
 // 速度环+电流环
 void M0_Set_Velocity(float Target)
 {
-    //Angle_Sensor0.velocity = Lowpassfilter(&M0_VEL_Filter, GetVelocity(&Angle_Sensor0));
-    //M0_Set_CurTorque(PID_Controller(&M0_VEL_PID, M0_DIR * (constrain(Target, -velocity_limit, velocity_limit) - Angle_Sensor0.velocity)));
-		float raw_vel = GetVelocity(&Angle_Sensor0);
-    Angle_Sensor0.velocity = Lowpassfilter(&M0_VEL_Filter, raw_vel);
-    
+    float raw_vel = GetVelocity(&Angle_Sensor0);
+
+    // 速度反馈统一到 M0 正方向
+    float vel = M0_DIR * raw_vel;
+
+    Angle_Sensor0.velocity = Lowpassfilter(&M0_VEL_Filter, vel);
+
     M0_VEL_PID.Target = constrain(Target, -velocity_limit, velocity_limit);
     M0_VEL_PID.Actual = Angle_Sensor0.velocity;
     PID_Controller(&M0_VEL_PID);
-    
-    M0_Set_CurTorque(M0_DIR * M0_VEL_PID.Out);
-	
-		//测试，串口输出代码
-//		print_cnt++;
-//    if(print_cnt >= 200)
-//    {
-//        print_cnt = 0;
-//        Serial_Printf(
-//            "Target:%.3f Vel:%.3f Vout:%.3f Zero:%.3f\r\n",
-//            M0_VEL_PID.Target,
-//            Angle_Sensor0.velocity,
-//            M0_VEL_PID.Out,
-//            M0_zero_elc_Angle
-//        );
-//    }
+
+    // 这里不要再乘 M0_DIR
+    M0_Set_CurTorque(M0_VEL_PID.Out);
 }
+
 
 void M1_Set_Velocity(float Target)
 {
-    Angle_Sensor1.velocity = Lowpassfilter(&M1_VEL_Filter, GetVelocity(&Angle_Sensor1));
-    //M1_Set_CurTorque(PID_Controller(&M1_VEL_PID, M1_DIR * (constrain(Target, -velocity_limit, velocity_limit) - Angle_Sensor1.velocity)));
-		M1_VEL_PID.Target = constrain(Target, -velocity_limit, velocity_limit);
+    float raw_vel = GetVelocity(&Angle_Sensor1);
+
+    // 关键：速度反馈统一到 M1 正方向
+    float vel = M1_DIR * raw_vel;
+
+    Angle_Sensor1.velocity = Lowpassfilter(&M1_VEL_Filter, vel);
+
+    M1_VEL_PID.Target = constrain(Target, -velocity_limit, velocity_limit);
     M1_VEL_PID.Actual = Angle_Sensor1.velocity;
     PID_Controller(&M1_VEL_PID);
-    
-    M1_Set_CurTorque(M1_DIR * M1_VEL_PID.Out);
+
+    // 关键：这里不要再乘 M1_DIR
+    M1_Set_CurTorque(M1_VEL_PID.Out);
 }
 
 //速度电压模式，跳过电流环
 void M0_Set_Velocity_Voltage(float Target)
 {
     float raw_vel = GetVelocity(&Angle_Sensor0);
-    Angle_Sensor0.velocity = Lowpassfilter(&M0_VEL_Filter, raw_vel);
+
+    // 关键：把 AS5600 原始速度转换成电机正方向速度
+    float vel = M0_DIR * raw_vel;
+
+    Angle_Sensor0.velocity = Lowpassfilter(&M0_VEL_Filter, vel);
 
     M0_VEL_PID.Target = constrain(Target, -velocity_limit, velocity_limit);
     M0_VEL_PID.Actual = Angle_Sensor0.velocity;
@@ -349,10 +380,15 @@ void M0_Set_Velocity_Voltage(float Target)
     SetPhaseVoltage(&M0, Uq, M0_electricAngle());
 }
 
+
 void M1_Set_Velocity_Voltage(float Target)
 {
     float raw_vel = GetVelocity(&Angle_Sensor1);
-    Angle_Sensor1.velocity = Lowpassfilter(&M1_VEL_Filter, raw_vel);
+
+    // 关键：速度反馈统一到 M1 正方向
+    float vel = M1_DIR * raw_vel;
+
+    Angle_Sensor1.velocity = Lowpassfilter(&M1_VEL_Filter, vel);
 
     M1_VEL_PID.Target = constrain(Target, -velocity_limit, velocity_limit);
     M1_VEL_PID.Actual = Angle_Sensor1.velocity;
@@ -368,10 +404,24 @@ void M1_Set_Velocity_Voltage(float Target)
 void M0_Set_Velocity_Angle(float Target) 
 {
     //M0_Set_Velocity(PID_Controller(&M0_ANG_PID, (Target - GetAngle(&Angle_Sensor0))));
-		M0_ANG_PID.Target = Target;
-    M0_ANG_PID.Actual = GetAngle(&Angle_Sensor0);
+    float actual_angle;
+    float err;
+	
+    // 关键：角度方向也统一到电机正方向
+    actual_angle = M0_DIR * GetAngle(&Angle_Sensor0);
+
+		err = Target - actual_angle;
+
+    if (err > -ANG_DEADBAND_RAD && err < ANG_DEADBAND_RAD)
+    {
+        M0_Set_Velocity(0.0f);
+        return;
+    }
+		
+    M0_ANG_PID.Target = Target;
+    M0_ANG_PID.Actual = actual_angle;
     PID_Controller(&M0_ANG_PID);
-    
+
     M0_Set_Velocity(M0_ANG_PID.Out);
 /*
 	三环含义
@@ -385,11 +435,22 @@ void M0_Set_Velocity_Angle(float Target)
 
 void M1_Set_Velocity_Angle(float Target)
 {
-    //M1_Set_Velocity(PID_Controller(&M1_ANG_PID, (Target - GetAngle(&Angle_Sensor1))));
+    float actual_angle;
+		float err;
+	
+    // 关键：角度反馈统一到 M1 正方向
+    actual_angle = M1_DIR * GetAngle(&Angle_Sensor1);
+    err = Target - actual_angle;
+
+    if (err > -ANG_DEADBAND_RAD && err < ANG_DEADBAND_RAD)
+    {
+        M1_Set_Velocity(0.0f);
+        return;
+    }
     M1_ANG_PID.Target = Target;
-    M1_ANG_PID.Actual = GetAngle(&Angle_Sensor1);
+    M1_ANG_PID.Actual = actual_angle;
     PID_Controller(&M1_ANG_PID);
-    
+
     M1_Set_Velocity(M1_ANG_PID.Out);
 }
 

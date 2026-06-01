@@ -24,308 +24,81 @@ extern Motor_t M0;
 extern Motor_t M1;
 extern float M0_zero_elc_Angle;
 extern float M1_zero_elc_Angle;
+extern volatile uint8_t g_ctrl_tick;
 
+/*
+ * KEY0 跟踪模式协议（主机 vision.c）：
+ *   "@dx,dy\r\n"  — dx/dy 为像素偏差（主机已做 ±10px 死区与方向修正）
+ *   "@0,0\r\n"    — 丢球或已居中，云台回初始角
+ *
+ * 像素 → 弧度：100px ≈ MAX_TRACK_OFFSET rad，现场可改 PIXEL_TO_RAD
+ */
+#define PIXEL_TO_RAD         0.0045f   /* 100px -> 0.45rad(约26°)，可按实际调小 */
+#define MAX_TRACK_OFFSET     0.45f     /* 相对初始角的最大偏转 */
 
-//测试用函数
-//uint16_t AS5600_ReadMagnitude(void)
-//{
-//    uint8_t high = AS5600_ReadReg(AS5600_MAGNITUDE_H);
-//    uint8_t low  = AS5600_ReadReg(AS5600_MAGNITUDE_L);
-
-//    return ((high & 0x0F) << 8) | low;
-//}
-
-////等 AS5600 有效，再启动电机，测试用函数
-//uint8_t AS5600_Magnet_OK(void)
-//{
-//		Set_Ang_Sensor(1);
-//	
-//    uint8_t status = AS5600_ReadReg(0x0B);
-
-//    uint8_t md = (status & 0x20) ? 1 : 0;
-//    uint8_t ml = (status & 0x10) ? 1 : 0;
-//    uint8_t mh = (status & 0x08) ? 1 : 0;
-
-//    if(md == 1 && ml == 0 && mh == 0)
-//        return 1;
-//    else
-//        return 0;
-//}
-
-////状态打印函数，测试用函数
-//void AS5600_PrintStatus_Mot(int mot)
-//{
-//    Set_Ang_Sensor(mot);
-
-//    uint8_t status = AS5600_ReadReg(0x0B);
-//    uint8_t agc = AS5600_ReadReg(0x1A);
-//    uint16_t magnitude = AS5600_ReadMagnitude();
-
-//    uint16_t raw = AS5600_GetRawData();
-//    float angle = raw / 4096.0f * 6.2831853f;
-
-//    uint8_t md = (status & 0x20) ? 1 : 0;
-//    uint8_t ml = (status & 0x10) ? 1 : 0;
-//    uint8_t mh = (status & 0x08) ? 1 : 0;
-
-//    Serial_Printf(
-//        "M%d Raw:%d Angle:%.3f STATUS:0x%02X MD:%d ML:%d MH:%d AGC:%d MAG:%d\r\n",
-//        mot,
-//        raw,
-//        angle,
-//        status,
-//        md,
-//        ml,
-//        mh,
-//        agc,
-//        magnitude
-//    );
-//}
-
-//OLED测试显示用函数
-void Format_SignedDecimal1(char *buf, int16_t raw)
-{
-    int32_t value = raw;
-    char sign = '+';
-
-    if (value < 0)
-    {
-        sign = '-';
-			value = -value;//将负数转化为正数
-    }
-
-    sprintf(buf, "%c%ld.%ld", sign, value / 10, value % 10);//将格式化的字符串送入buf
-}
 
 //下述为电机驱控主要操控模块
-//int main(void)
-//{
-//	/*模块初始化*/
-//	LED_Init();			//LED初始化
-//	Serial_Init();		//串口初始化
-//	Motor_en(); //电机使能
-//	FOC_Init(12.6);
-//	Systick_CountMode();
-	
-//	int16_t raw_dy,raw_dx;
-//	float dx = 0;
-//	float dy = 0;
-
-//	while (1)
-//	{
-//			
-//		if (Serial_RxFlag == 1)		//如果接收到数据包
-//		{
-//			if (sscanf((char *)Serial_RxPacket, "%hd,%hd", &raw_dx, &raw_dy) == 2)//接收两个短整型成功
-//					{
-//						           
-//
-//                // 驱动 dx
-//                Format_SignedDecimal1(dx, raw_dx);
-//								M1_Set_Velocity(dx);
-//								//驱动dy
-//                Format_SignedDecimal1(dy, raw_dy);
-//                M0_Set_Velocity(dy);
-//						
-//					}	
-//			Serial_RxFlag = 0;			//处理完成后，需要将接收数据包标志位清零，否则将无法接收后续数据包
-//		}
-
-//	}
-//}
-
-//测试OLED对于字符的显示
 int main(void)
 {
+	int16_t raw_dx, raw_dy;
+	static float target_m1 = 0.0f;   /* 水平轴 M1 */
+	static float target_m0 = 0.0f;   /* 垂直轴 M0 */
+	static float M0_home_angle = 0.0f;
+	static float M1_home_angle = 0.0f;
+
+
+	
 	/*模块初始化*/
 	LED_Init();			//LED初始化
-	OLED_Init();
 	Serial_Init();		//串口初始化
-	int16_t raw_dy,raw_dx;
-	float dx = 0;
-  float dy = 0;
-	char OLED_Buf[16];
+	Motor_en(); //电机使能
+	FOC_Init(12.6);
+	Systick_CountMode();
+	Ctrl_Timer_Init();          /* 放在 FOC_Init(12.6) 之后 */
 	
-	OLED_ShowString(1, 1, "H:");
-	OLED_ShowString(3, 1, "V:");
+
+	/* 记录上电初始角，跟踪目标 = 初始角 + 像素映射偏移 */
+	M0_home_angle = (float)M0_DIR * GetAngle(&Angle_Sensor0);
+	M1_home_angle = (float)M1_DIR * GetAngle(&Angle_Sensor1);
+	target_m0 = M0_home_angle;
+	target_m1 = M1_home_angle;
+
 	
 	while (1)
 	{
-			
-		if (Serial_RxFlag == 1)		//如果接收到数据包
+		if (Serial_RxFlag == 1) 
 		{
-				if (sscanf((char *)Serial_RxPacket, "%hd,%hd", &raw_dx, &raw_dy) == 2)//接收两个短整型成功
-            {
-                dx = raw_dx / 10.0f;
-                dy = raw_dy / 10.0f;
-
-                // 显示 dx
-                OLED_ShowString(1, 4, "        ");     // 清除旧数据
-                Format_SignedDecimal1(OLED_Buf, raw_dx);
-                OLED_ShowString(1, 4, OLED_Buf);
-
-                // 显示 dy
-                OLED_ShowString(3, 4, "        ");     // 清除旧数据
-                Format_SignedDecimal1(OLED_Buf, raw_dy);
-                OLED_ShowString(3, 4, OLED_Buf);
-						}
+			if (sscanf((char *)Serial_RxPacket, "%hd,%hd", &raw_dx, &raw_dy) == 2) 
+			{
+				if (raw_dx == 0 && raw_dy == 0)
+				{
+					/* 丢球或主机判定已居中：回到初始角，消除累加漂移 */
+					target_m1 = M1_home_angle;
+					target_m0 = M0_home_angle;
+				}
+				else
+				{
+					float off_x = constrain((float)raw_dx * PIXEL_TO_RAD,
+					                        -MAX_TRACK_OFFSET, MAX_TRACK_OFFSET);
+					float off_y = constrain((float)raw_dy * PIXEL_TO_RAD,
+					                        -MAX_TRACK_OFFSET, MAX_TRACK_OFFSET);
+					target_m1 = M1_home_angle + off_x;
+					target_m0 = M0_home_angle + off_y;
+				}
+			}
+			Serial_RxFlag = 0;
+		}
 		
-			Serial_RxFlag = 0;			//处理完成后，需要将接收数据包标志位清零，否则将无法接收后续数据包
+		/* FOC 1kHz，与串口解耦 */
+		if (g_ctrl_tick) 
+		{
+			g_ctrl_tick = 0;
+			M1_Set_Velocity_Angle(target_m1);
+			M0_Set_Velocity_Angle(target_m0);
 		}
 
 	}
 }
 
-/*测试部分*/
-//测试as5600是否安装正常
-//int main(void)
-//{
-//    LED_Init();
-//    Serial_Init();
-
-//    AS5600_Init();
-
-//    while(1)
-//    {
-//        AS5600_PrintStatus_Mot(1);   // 重点：这里是 1，表示 M1
-
-//        Delay_ms(200);
-//    }
-//}
-
-//测试三相PWM和电机时序是否正常，&测试上电角度读取是否正常
-//int main(void)
-//{
-//    LED_Init();
-//    Serial_Init();
-
-//    Motor_en();
-//    FOC_Init(12.6);
-
-//    float open_angle = 0.0f;
-
-//    while(1)
-//    {
-//        SetPhaseVoltage(&M1, 1.0f, open_angle);
-
-//        open_angle += 0.02f;
-//        if(open_angle > 6.2831853f)
-//        {
-//            open_angle -= 6.2831853f;
-//        }
-
-//        //Set_Ang_Sensor(0);
-//        uint16_t raw = AS5600_GetRawData();
-
-//        //Serial_Printf("open:%.3f raw:%d\r\n", open_angle, raw);
-
-//        Delay_ms(5);
-//    }
-//}
-
-//测试M1是否能完成电压测试
-//int main(void)
-//{
-//    LED_Init();
-//    Serial_Init();
-
-//    Motor_en();
-//    FOC_Init(12.6);
-
-//    float open_angle = 0.0f;
-
-//    while(1)
-//    {
-//				
-//			SetPhaseVoltage(&M1, 1.5f, M1_electricAngle());
-//     
-//    }
-//}
-
-////低速测试
-//int main(void)
-//{
-//    LED_Init();
-//    Serial_Init();
-
-//    AS5600_Init();
-
-//    while(AS5600_Magnet_OK() == 0)
-//    {
-//        Serial_SendString("AS5600 magnet error\r\n");
-//        Delay_ms(100);
-//    }
-
-//    Motor_en();
-//    FOC_Init(12.6);
-//    Systick_CountMode();
-//		
-//		
-
-//    while (1)
-//    {
-//        M0_Set_Velocity(0.1f);
 
 
-//    }
-//}
-
-////直流电压测试
-//int main(void)
-//{
-//    LED_Init();
-//    Serial_Init();
-
-//    AS5600_Init();
-
-//    while(AS5600_Magnet_OK() == 0)
-//    {
-//        Serial_SendString("AS5600 magnet error\r\n");
-//        Delay_ms(100);
-//    }
-
-//    Motor_en();
-//    FOC_Init(12.6);
-//    Systick_CountMode();
-//		
-//		float open_angle = 0.0f;
-//		uint16_t cnt = 0;
-//		
-//    while (1)
-//    {
-//			//M0_Set_Velocity_Voltage(1.2f);
-//			M1_Set_Velocity(1);
-//   
-
-////			open_angle += 0.01f;
-
-////			if(open_angle > 6.2831853f)
-////			{
-////					open_angle = 0.0f;
-////			}
-////		
-////			    cnt++;
-////    if(cnt >= 100)
-////    {
-////        cnt = 0;
-
-////        Set_Ang_Sensor(0);
-////        uint16_t raw = AS5600_GetRawData();
-
-////        float raw_el = M0_rawElectricAngle();
-////        float closed_el = M0_electricAngle();
-
-////        Serial_Printf(
-////            "open:%.3f raw:%d raw_el:%.3f closed_el:%.3f zero:%.3f\r\n",
-////            open_angle,
-////            raw,
-////            raw_el,
-////            closed_el,
-////            M0_zero_elc_Angle
-////        );
-////    }
-//			
-//			Delay_ms(1);
-
-//    }
-//}
